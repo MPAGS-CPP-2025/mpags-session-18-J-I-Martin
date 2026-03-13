@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -107,35 +109,131 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Request construction of the appropriate cipher(s)
-    std::vector<std::unique_ptr<Cipher>> ciphers;
+    // set up threads
+    const std::size_t threadTimeOut{
+        1};    // global override, should eventually be set by input
     std::size_t nCiphers{settings.cipherType.size()};
-    ciphers.reserve(nCiphers);
-    for (std::size_t iCipher{0}; iCipher < nCiphers; ++iCipher) {
-        try {
-            ciphers.push_back(CipherFactory::makeCipher(
-                settings.cipherType[iCipher], settings.cipherKey[iCipher]));
-        } catch (const InvalidKey& e) {
-            std::cerr << "[error] Invalid key: " << e.what() << std::endl;
-            return 1;
-        }
+    std::size_t numThreads{};
+    if (nCiphers == 1 && settings.cipherType[0] == CipherType::Caesar) {
+        numThreads = std::thread::hardware_concurrency();
+    } else {
+        numThreads = 1;
+    }
 
-        // Check that the cipher was constructed successfully
-        if (!ciphers.back()) {
-            std::cerr << "[error] problem constructing requested cipher"
+    // if caesar cipher only, apply threading, else proceed as normal (i.e. single thread)
+    if (numThreads > 1) {
+        // Request construction of the appropriate cipher(s)
+        std::vector<std::unique_ptr<Cipher>> ciphers;
+        ciphers.reserve(numThreads);
+
+        // split input over nThreads chunks
+        std::vector<std::string> textChunks(numThreads);
+        // if the text doesn't divide equally into nThreads, we add one to the
+        // chunk size to ensure all text is included in the chunks
+        std::size_t chunkSize = cipherText.size() / numThreads;
+        if (cipherText.size() % numThreads != 0) {
+            chunkSize += 1;
+        }
+        for (std::size_t iChunk{0}; iChunk < numThreads; ++iChunk) {
+            textChunks[iChunk] =
+                cipherText.substr(iChunk * chunkSize, chunkSize);
+        }
+        // debug; print chunks
+        for (std::size_t iChunk{0}; iChunk < numThreads; ++iChunk) {
+            std::cout << "chunk " << iChunk << ": " << textChunks[iChunk]
                       << std::endl;
-            return 1;
         }
-    }
 
-    // If we are decrypting, we need to reverse the order of application of the ciphers
-    if (settings.cipherMode == CipherMode::Decrypt) {
-        std::reverse(ciphers.begin(), ciphers.end());
-    }
+        // fill ciphers vector with nThreads copies of the same cipher
+        for (std::size_t iThread{0}; iThread < numThreads; ++iThread) {
+            try {
+                ciphers[iThread] = CipherFactory::makeCipher(
+                    settings.cipherType[0], settings.cipherKey[0]);
+            } catch (const InvalidKey& e) {
+                std::cerr << "[error] Invalid key: " << e.what() << std::endl;
+                return 1;
+            }
+            // Check that the cipher was constructed successfully
+            if (!ciphers.back()) {
+                std::cerr << "[error] problem constructing requested cipher"
+                          << std::endl;
+                return 1;
+            }
+        }
 
-    // Run the cipher(s) on the input text, specifying whether to encrypt/decrypt
-    for (const auto& cipher : ciphers) {
-        cipherText = cipher->applyCipher(cipherText, settings.cipherMode);
+        // create lambda function to apply cipher to a chunk of input text
+        auto applyCipherToChunk = [&textChunks, &settings,
+                                   &ciphers](std::size_t iChunk) {
+            std::string chunkOutput{textChunks[iChunk]};
+            chunkOutput =
+                ciphers[iChunk]->applyCipher(chunkOutput, settings.cipherMode);
+            return chunkOutput;
+        };
+
+        // create vector to hold futures for each thread
+        std::vector<std::future<std::string>> futures;
+        futures.reserve(numThreads);
+
+        // start threads to apply cipher to each chunk of input text
+        for (std::size_t iThread{0}; iThread < numThreads; ++iThread) {
+            futures.push_back(
+                std::async(std::launch::async, applyCipherToChunk, iThread));
+        }
+
+        // wait for all threads to finish
+        std::vector<bool> threadFinished(numThreads, false);
+        do {
+            for (std::size_t iThread{0}; iThread < numThreads; ++iThread) {
+                if (futures[iThread].wait_for(std::chrono::seconds(
+                        threadTimeOut)) == std::future_status::ready) {
+                    threadFinished[iThread] = true;
+                } else if (futures[iThread].wait_for(std::chrono::seconds(
+                               threadTimeOut)) == std::future_status::timeout) {
+                    std::cerr << "[warning] thread " << iThread << " timeout"
+                              << std::endl;
+                }
+            }
+        } while (std::any_of(threadFinished.begin(), threadFinished.end(),
+                             [](bool finished) { return !finished; }));
+
+        // concatenate output from each thread
+        std::string rebuiltText = "";
+        for (std::size_t iThread{0}; iThread < numThreads; ++iThread) {
+            rebuiltText += futures[iThread].get();
+        }
+        // after construction, override cipherText with the result of the threaded application of the cipher
+        cipherText = rebuiltText;
+    } else {
+        // we have multiple ciphers to apply in order, or a single non-Caesar cipher
+        // Request construction of the appropriate cipher(s)
+        std::vector<std::unique_ptr<Cipher>> ciphers;
+        ciphers.reserve(nCiphers);
+        for (std::size_t iCipher{0}; iCipher < nCiphers; ++iCipher) {
+            try {
+                ciphers.push_back(CipherFactory::makeCipher(
+                    settings.cipherType[iCipher], settings.cipherKey[iCipher]));
+            } catch (const InvalidKey& e) {
+                std::cerr << "[error] Invalid key: " << e.what() << std::endl;
+                return 1;
+            }
+
+            // Check that the cipher was constructed successfully
+            if (!ciphers.back()) {
+                std::cerr << "[error] problem constructing requested cipher"
+                          << std::endl;
+                return 1;
+            }
+        }
+
+        // If we are decrypting, we need to reverse the order of application of the ciphers
+        if (settings.cipherMode == CipherMode::Decrypt) {
+            std::reverse(ciphers.begin(), ciphers.end());
+        }
+
+        // Run the cipher(s) on the input text, specifying whether to encrypt/decrypt
+        for (const auto& cipher : ciphers) {
+            cipherText = cipher->applyCipher(cipherText, settings.cipherMode);
+        }
     }
 
     // Output the encrypted/decrypted text to stdout/file
